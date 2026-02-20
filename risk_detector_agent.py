@@ -16,16 +16,17 @@ import os
 import re
 import json
 import time
+import hashlib
 import argparse
 import logging
 from dataclasses import dataclass, asdict, field
 from typing import Literal
+from dotenv import load_dotenv
+load_dotenv()  # Load env variables from .env file if present
 
 import numpy as np
 import faiss
 from openai import OpenAI
-from dotenv import load_dotenv
-load_dotenv()
 
 # Silence HuggingFace output
 os.environ["TRANSFORMERS_VERBOSITY"]       = "error"
@@ -38,12 +39,13 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
-GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "your-key-here")  # Set this in your .env file or environment variables
+GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 TOP_K         = 3
 RISK_ORDER    = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 RISK_ICONS    = {"critical": "!!!", "high": " !!", "medium": "  !", "low": "  i"}
+CACHE_FILE    = "risk_cache.json"   # persists across runs
 
 # ── Prompts ─────────────────────────────────────────────────────────────────
 #
@@ -206,6 +208,57 @@ def kv_to_list(val: str) -> list:
 
 # ── Risk Detector Agent ──────────────────────────────────────────────────────
 
+# ── Risk Cache ──────────────────────────────────────────────────────────────
+
+class RiskCache:
+    """
+    File-based cache for clause risk results.
+    Key   = SHA-256 hash of the first 350 chars of clause text.
+    Value = the full RiskResult stored as a dict.
+    Persists to disk so results survive restarts.
+    """
+
+    def __init__(self, path: str = CACHE_FILE):
+        self.path = path
+        self._data: dict = {}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                self._data = json.load(open(self.path, encoding="utf-8"))
+            except Exception:
+                self._data = {}
+
+    def _save(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, indent=2)
+
+    @staticmethod
+    def _key(clause_text: str) -> str:
+        snippet = clause_text[:350].strip()
+        return hashlib.sha256(snippet.encode()).hexdigest()
+
+    def get(self, clause_text: str):
+        """Return cached RiskResult dict or None."""
+        return self._data.get(self._key(clause_text))
+
+    def set(self, clause_text: str, result: dict):
+        """Store a RiskResult dict in cache and persist to disk."""
+        self._data[self._key(clause_text)] = result
+        self._save()
+
+    def clear(self):
+        """Wipe the cache file and memory."""
+        self._data = {}
+        if os.path.exists(self.path):
+            os.remove(self.path)
+        print("[Cache] Cleared.")
+
+    def stats(self) -> str:
+        return f"[Cache] {len(self._data)} clause(s) cached  →  {self.path}"
+
+
 class RiskDetectorAgent:
     def __init__(self, api_key=GROQ_API_KEY, model=DEFAULT_MODEL,
                  base_url=GROQ_BASE_URL,
@@ -213,18 +266,23 @@ class RiskDetectorAgent:
         self.db       = VectorDB(index_path, meta_path)
         self.embedder = LegalBERTEmbedder()
         self.llm      = LLMClient(api_key=api_key, model=model, base_url=base_url)
+        self.cache    = RiskCache()
 
     # ── Analyze one clause ──────────────────────────────────────────────────
 
     def _analyze(self, clause: dict) -> RiskResult:
-        # Trim clause to 350 chars to keep tokens low
+        # ── Cache check ────────────────────────────────────────────
+        cached = self.cache.get(clause["clause_text"])
+        if cached:
+            return RiskResult(**cached)
+
+        # ── LLM call ───────────────────────────────────────────────
         snippet = clause["clause_text"][:350].replace("\n", " ").strip()
         raw     = self.llm.call(ANALYZE_PROMPT.format(clause=snippet), max_tokens=180)
         kv      = parse_kv(raw)
 
         rl = kv.get("RISK_LEVEL", "medium").strip().lower()
         if rl not in RISK_ORDER:
-            # Try to find a risk word anywhere in the response
             for level in ("critical", "high", "low", "medium"):
                 if level in raw.lower():
                     rl = level
@@ -232,7 +290,7 @@ class RiskDetectorAgent:
             else:
                 rl = "medium"
 
-        return RiskResult(
+        result = RiskResult(
             clause_id=clause.get("id", ""),
             clause_text=clause["clause_text"],
             legal_types=clause.get("legal_types", []),
@@ -246,6 +304,10 @@ class RiskDetectorAgent:
             recommendation=kv.get("RECOMMENDATION", "").strip('"'),
         )
 
+        # ── Store in cache ─────────────────────────────────────────
+        self.cache.set(clause["clause_text"], asdict(result))
+        return result
+
     # ── Full scan ───────────────────────────────────────────────────────────
 
     def scan(self, min_risk: str = "low") -> ScanReport:
@@ -254,15 +316,22 @@ class RiskDetectorAgent:
         counts   = {"low": 0, "medium": 0, "high": 0, "critical": 0}
         results  = []
 
+        hits = 0
         for i, clause in enumerate(clauses):
-            print(f"  Analyzing {i+1}/{len(clauses)}...", end="\r")
+            cached = self.cache.get(clause["clause_text"])
+            tag    = "cached" if cached else "LLM"
+            print(f"  Analyzing {i+1}/{len(clauses)}  [{tag}]...", end="\r")
             result = self._analyze(clause)
             counts[result.risk_level] = counts.get(result.risk_level, 0) + 1
             if RISK_ORDER.get(result.risk_level, 0) >= min_idx:
                 results.append(result)
-            time.sleep(2)  # 30 req/min limit = 1 per 2s
+            if cached:
+                hits += 1
+            else:
+                time.sleep(2)  # only delay on real LLM calls
 
         print()
+        print(self.cache.stats() + f"  |  hits this scan: {hits}/{len(clauses)}")
         results.sort(key=lambda r: RISK_ORDER.get(r.risk_level, 0), reverse=True)
 
         top_text = "\n".join(
@@ -379,17 +448,21 @@ def run_interactive(agent: RiskDetectorAgent):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Risk Detector Agent")
-    ap.add_argument("--scan",     action="store_true")
-    ap.add_argument("--query",    type=str)
-    ap.add_argument("--min-risk", type=str, default="low",
+    ap.add_argument("--scan",        action="store_true")
+    ap.add_argument("--query",       type=str)
+    ap.add_argument("--min-risk",    type=str, default="low",
                     choices=["low", "medium", "high", "critical"])
-    ap.add_argument("--report",   type=str, help="Save JSON report to file")
-    ap.add_argument("--model",    type=str, default=DEFAULT_MODEL,
+    ap.add_argument("--report",      type=str, help="Save JSON report to file")
+    ap.add_argument("--model",       type=str, default=DEFAULT_MODEL,
                     help="Model name, e.g. llama-3.3-70b-versatile or openai/gpt-oss-120b")
-    ap.add_argument("--apikey",   type=str, default="")
-    ap.add_argument("--base-url", type=str, default=GROQ_BASE_URL)
-    ap.add_argument("--index",    type=str, default=FAISS_INDEX_PATH)
-    ap.add_argument("--meta",     type=str, default=METADATA_PATH)
+    ap.add_argument("--apikey",      type=str, default="")
+    ap.add_argument("--base-url",    type=str, default=GROQ_BASE_URL)
+    ap.add_argument("--index",       type=str, default=FAISS_INDEX_PATH)
+    ap.add_argument("--meta",        type=str, default=METADATA_PATH)
+    ap.add_argument("--clear-cache", action="store_true",
+                    help="Delete the risk cache before running")
+    ap.add_argument("--cache-stats", action="store_true",
+                    help="Show cache statistics and exit")
     args = ap.parse_args()
 
     agent = RiskDetectorAgent(
@@ -399,6 +472,13 @@ if __name__ == "__main__":
         index_path=args.index,
         meta_path=args.meta,
     )
+
+    if args.cache_stats:
+        print(agent.cache.stats())
+        raise SystemExit(0)
+
+    if args.clear_cache:
+        agent.cache.clear()
 
     if args.scan:
         report = agent.scan(min_risk=args.min_risk)

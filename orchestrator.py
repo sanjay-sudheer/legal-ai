@@ -65,7 +65,7 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────
-GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "your-key-here")  # Set this in your .env file or environment variables
+GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL    = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 UPLOAD_FOLDER = Path(tempfile.gettempdir()) / "legal_ai_uploads"
@@ -409,10 +409,20 @@ def list_documents():
 @app.route("/documents", methods=["DELETE"])
 def clear_documents():
     try:
+        # Clear vector DB
         for path in [FAISS_INDEX_PATH, METADATA_PATH]:
             if os.path.exists(path):
                 os.remove(path)
-        return jsonify({"success": True, "message": "Vector DB cleared."})
+
+        # Clear risk cache
+        from risk_detector_agent import CACHE_FILE
+        if os.path.exists(CACHE_FILE):
+            os.remove(CACHE_FILE)
+
+        return jsonify({
+            "success": True,
+            "message": "Vector DB and risk cache cleared."
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
