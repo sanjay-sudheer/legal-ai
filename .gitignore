@@ -1,5 +1,6 @@
+legal_faiss.index
+legal_metadata.json
 venv
 .env
 __pycache__
 *.pyc
-

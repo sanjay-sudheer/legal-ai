@@ -23,6 +23,8 @@ import logging
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import List
+from dotenv import load_dotenv
+load_dotenv()
 
 import numpy as np
 import faiss

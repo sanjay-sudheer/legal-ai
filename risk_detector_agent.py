@@ -24,6 +24,8 @@ from typing import Literal
 import numpy as np
 import faiss
 from openai import OpenAI
+from dotenv import load_dotenv
+load_dotenv()
 
 # Silence HuggingFace output
 os.environ["TRANSFORMERS_VERBOSITY"]       = "error"
