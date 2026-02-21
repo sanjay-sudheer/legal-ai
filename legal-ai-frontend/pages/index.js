@@ -301,23 +301,127 @@ function MessageBubble({ msg, idx }) {
 
 // ─── Upload Panel ────────────────────────────────────────────────────────────
 
+function ScanProgressBar({ scan }) {
+  if (!scan.running && !scan.done) return null
+  const pct = scan.percent || 0
+  const isRunning = scan.running
+
+  return (
+    <div style={{ borderRadius: 10, overflow: 'hidden', border: `1px solid ${isRunning ? 'rgba(255,128,64,0.3)' : 'rgba(0,204,136,0.3)'}`, background: isRunning ? 'rgba(255,128,64,0.05)' : 'rgba(0,204,136,0.05)' }}>
+      {/* Header row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', borderBottom: `1px solid ${isRunning ? 'rgba(255,128,64,0.2)' : 'rgba(0,204,136,0.2)'}` }}>
+        <AlertTriangle size={12} style={{ color: isRunning ? 'var(--orange)' : 'var(--green)', flexShrink: 0 }} />
+        <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 10.5, color: isRunning ? 'var(--orange)' : 'var(--green)', letterSpacing: '0.05em', flex: 1 }}>
+          {isRunning ? 'RISK SCAN IN PROGRESS' : 'RISK SCAN COMPLETE'}
+        </span>
+        {isRunning && (
+          <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 10, color: 'var(--text3)' }}>
+            {scan.current}/{scan.total}
+          </span>
+        )}
+        {!isRunning && scan.done && (
+          <CheckCircle size={12} style={{ color: 'var(--green)' }} />
+        )}
+      </div>
+
+      {/* Progress bar */}
+      <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ height: 5, borderRadius: 3, background: 'var(--border2)', overflow: 'hidden' }}>
+          <div style={{
+            height: '100%',
+            width: `${pct}%`,
+            borderRadius: 3,
+            background: isRunning
+              ? 'linear-gradient(90deg, var(--orange), var(--gold))'
+              : 'linear-gradient(90deg, var(--green), #00FF99)',
+            transition: 'width 0.6s ease',
+            boxShadow: isRunning ? '0 0 8px rgba(255,128,64,0.5)' : '0 0 8px rgba(0,204,136,0.5)',
+          }} />
+        </div>
+
+        {/* Stats row */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 10, color: 'var(--text3)' }}>
+            {isRunning
+              ? `Analysing clause ${scan.current} of ${scan.total}...`
+              : `${scan.total} clauses analysed${scan.failed > 0 ? ` · ${scan.failed} failed` : ''}`
+            }
+          </span>
+          <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, color: isRunning ? 'var(--orange)' : 'var(--green)', fontWeight: 600 }}>
+            {pct}%
+          </span>
+        </div>
+
+        {/* Executive summary once done */}
+        {!isRunning && scan.summary && (
+          <div style={{ marginTop: 2, padding: '8px 10px', background: 'rgba(0,204,136,0.06)', borderRadius: 7, border: '1px solid rgba(0,204,136,0.15)' }}>
+            <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9.5, color: 'var(--green)', letterSpacing: '0.06em', marginBottom: 4 }}>EXECUTIVE SUMMARY</div>
+            <p style={{ fontSize: 11.5, color: 'var(--text2)', lineHeight: 1.7 }}>{scan.summary}</p>
+          </div>
+        )}
+        {scan.error && (
+          <div style={{ fontSize: 11, color: 'var(--red)', fontFamily: "'JetBrains Mono',monospace" }}>
+            ✗ {scan.error}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function UploadPanel({ onUploaded, docStatus }) {
-  const [dragging, setDragging] = useState(false)
-  const [files, setFiles] = useState([])
+  const [dragging, setDragging]   = useState(false)
   const [uploading, setUploading] = useState(false)
-  const [result, setResult] = useState(null)
-  const inputRef = useRef()
+  const [result, setResult]       = useState(null)
+  const [scan, setScan]           = useState({ running: false, done: false, percent: 0, current: 0, total: 0, summary: '', error: '' })
+  const inputRef  = useRef()
+  const pollRef   = useRef(null)
+
+  // Poll /scan-status while scan is running
+  const startPolling = () => {
+    if (pollRef.current) return
+    pollRef.current = setInterval(async () => {
+      try {
+        const res  = await fetch(`${API}/scan-status`)
+        const data = await res.json()
+        setScan(data)
+        if (!data.running) {
+          clearInterval(pollRef.current)
+          pollRef.current = null
+          onUploaded()  // refresh status once scan completes
+        }
+      } catch { /* ignore poll errors */ }
+    }, 1500)
+  }
+
+  // On mount: check if scan already in progress (e.g. page refresh)
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res  = await fetch(`${API}/scan-status`)
+        const data = await res.json()
+        setScan(data)
+        if (data.running) startPolling()
+      } catch {}
+    }
+    check()
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  }, [])
 
   const doUpload = async (fileList) => {
     setUploading(true)
     setResult(null)
+    setScan({ running: false, done: false, percent: 0, current: 0, total: 0, summary: '', error: '' })
     try {
       const fd = new FormData()
       for (const f of fileList) fd.append('files', f)
-      const res = await fetch(`${API}/upload`, { method: 'POST', body: fd })
+      const res  = await fetch(`${API}/upload`, { method: 'POST', body: fd })
       const data = await res.json()
       setResult(data)
-      if (data.success) onUploaded()
+      if (data.success) {
+        onUploaded()
+        if (data.scan_started) startPolling()
+      }
     } catch (e) {
       setResult({ success: false, error: e.message })
     }
@@ -327,28 +431,24 @@ function UploadPanel({ onUploaded, docStatus }) {
   const handleDrop = (e) => {
     e.preventDefault()
     setDragging(false)
-    const dropped = Array.from(e.dataTransfer.files)
-    setFiles(dropped)
-    doUpload(dropped)
+    doUpload(Array.from(e.dataTransfer.files))
   }
 
-  const handleSelect = (e) => {
-    const selected = Array.from(e.target.files)
-    setFiles(selected)
-    doUpload(selected)
-  }
+  const handleSelect = (e) => doUpload(Array.from(e.target.files))
 
   const clearDB = async () => {
     try {
       await fetch(`${API}/documents`, { method: 'DELETE' })
       setResult(null)
-      setFiles([])
+      setScan({ running: false, done: false, percent: 0, current: 0, total: 0, summary: '', error: '' })
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
       onUploaded()
     } catch (e) { console.error(e) }
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+
       {/* Status line */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -369,31 +469,30 @@ function UploadPanel({ onUploaded, docStatus }) {
       {/* Drop zone */}
       <div
         className={`upload-zone${dragging ? ' dragging' : ''}`}
-        style={{ padding: 28, textAlign: 'center', cursor: 'pointer' }}
+        style={{ padding: 24, textAlign: 'center', cursor: uploading ? 'default' : 'pointer' }}
         onDragEnter={e => { e.preventDefault(); setDragging(true) }}
         onDragOver={e => { e.preventDefault(); setDragging(true) }}
         onDragLeave={() => setDragging(false)}
         onDrop={handleDrop}
-        onClick={() => inputRef.current?.click()}>
+        onClick={() => !uploading && inputRef.current?.click()}>
         <input ref={inputRef} type="file" multiple accept=".pdf,.docx,.txt" style={{ display: 'none' }} onChange={handleSelect} />
-
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
-          <div style={{ width: 52, height: 52, borderRadius: 14, background: 'var(--surface2)', border: '1px solid var(--border2)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
+          <div style={{ width: 46, height: 46, borderRadius: 12, background: 'var(--surface2)', border: '1px solid var(--border2)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             {uploading
-              ? <RefreshCw size={22} style={{ color: 'var(--gold)', animation: 'spin-slow 1s linear infinite' }} />
-              : <Upload size={22} style={{ color: dragging ? 'var(--cyan)' : 'var(--gold)' }} />
+              ? <RefreshCw size={20} style={{ color: 'var(--gold)', animation: 'spin-slow 1s linear infinite' }} />
+              : <Upload size={20} style={{ color: dragging ? 'var(--cyan)' : 'var(--gold)' }} />
             }
           </div>
           <div>
-            <div style={{ fontSize: 13.5, color: uploading ? 'var(--gold)' : 'var(--text)', fontWeight: 500, marginBottom: 4 }}>
-              {uploading ? 'Processing document...' : dragging ? 'Drop to upload' : 'Drop files here or click to browse'}
+            <div style={{ fontSize: 13, color: uploading ? 'var(--gold)' : 'var(--text)', fontWeight: 500, marginBottom: 3 }}>
+              {uploading ? 'Ingesting document...' : dragging ? 'Drop to upload' : 'Drop files here or click to browse'}
             </div>
-            <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 10.5, color: 'var(--text3)' }}>PDF · DOCX · TXT</div>
+            <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 10, color: 'var(--text3)' }}>PDF · DOCX · TXT</div>
           </div>
         </div>
       </div>
 
-      {/* Current files */}
+      {/* Indexed docs */}
       {docStatus.docs?.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
           {docStatus.docs.map((doc, i) => {
@@ -411,17 +510,29 @@ function UploadPanel({ onUploaded, docStatus }) {
 
       {/* Upload result */}
       {result && (
-        <div style={{ borderRadius: 10, padding: '10px 14px', background: result.success ? 'rgba(0,204,136,0.07)' : 'rgba(255,69,69,0.07)', border: `1px solid ${result.success ? 'rgba(0,204,136,0.25)' : 'rgba(255,69,69,0.25)'}` }}>
+        <div style={{ borderRadius: 10, padding: '9px 13px', background: result.success ? 'rgba(0,204,136,0.07)' : 'rgba(255,69,69,0.07)', border: `1px solid ${result.success ? 'rgba(0,204,136,0.25)' : 'rgba(255,69,69,0.25)'}` }}>
           <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, color: result.success ? 'var(--green)' : 'var(--red)' }}>
-            {result.success ? `✓ ${result.files_uploaded} file(s) uploaded · ${result.clause_count} clauses indexed` : `✗ ${result.error}`}
+            {result.success
+              ? `✓ ${result.files_uploaded} file(s) uploaded · ${result.clause_count} clauses indexed`
+              : `✗ ${result.error}`
+            }
           </div>
           {result.details?.map((d, i) => (
             <div key={i} style={{ fontSize: 11, color: d.success ? 'var(--text3)' : 'var(--red)', marginTop: 3 }}>
               {d.file}: {d.success ? `${d.clauses_added} clauses` : d.error}
             </div>
           ))}
+          {result.scan_started && (
+            <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 10.5, color: 'var(--orange)', marginTop: 5 }}>
+              ⚡ Risk scan started in background...
+            </div>
+          )}
         </div>
       )}
+
+      {/* Live scan progress bar */}
+      <ScanProgressBar scan={scan} />
+
     </div>
   )
 }
