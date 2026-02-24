@@ -63,6 +63,70 @@ function CopyBtn({ text }) {
   )
 }
 
+function DownloadPDFBtn({ text, filename = 'response.pdf' }) {
+  const handleDownload = () => {
+    // Create a printable window with the content formatted as PDF
+    const win = window.open('', '_blank')
+    const htmlContent = text
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\n(Note|NOTE):.*(\n|$)/g, '')   // strip Note: lines
+      .replace(/\n/g, '<br/>')
+    win.document.write(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Legal Response</title>
+        <style>
+          body { font-family: Georgia, serif; font-size: 13pt; line-height: 1.8; color: #1a1a1a; max-width: 800px; margin: 40px auto; padding: 0 40px; }
+          strong { font-weight: bold; }
+          @page { margin: 20mm; size: A4; }
+          @media print {
+            body { margin: 0; }
+            html { -webkit-print-color-adjust: exact; }
+          }
+        </style>
+      </head>
+      <body>
+        <div>${htmlContent}</div>
+        <script>
+          window.onload = () => {
+            // Remove browser default header/footer via title trick
+            document.title = '';
+            window.print();
+          };
+        <\/script>
+      </body>
+      </html>
+    `)
+    win.document.close()
+  }
+  return (
+    <button
+      onClick={handleDownload}
+      style={{ background: 'rgba(0,204,136,0.1)', border: '1px solid rgba(0,204,136,0.3)', borderRadius: 6, padding: '4px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, color: 'var(--green)', fontFamily: "'JetBrains Mono',monospace", fontSize: 11, transition: 'all 0.2s' }}>
+      <Download size={11} /> download pdf
+    </button>
+  )
+}
+
+
+
+function RichText({ text, style = {} }) {
+  if (!text) return null
+  // Split on **...** patterns and render bold segments
+  const parts = text.split(/(\*\*[^*]+\*\*)/g)
+  return (
+    <span style={style}>
+      {parts.map((part, i) => {
+        if (part.startsWith('**') && part.endsWith('**')) {
+          return <strong key={i}>{part.slice(2, -2)}</strong>
+        }
+        return <span key={i}>{part}</span>
+      })}
+    </span>
+  )
+}
+
 // ─── Agent Activity Panel ────────────────────────────────────────────────────
 
 function AgentPanel({ states }) {
@@ -164,7 +228,7 @@ function SynthesisCard({ response }) {
             </div>
             <CopyBtn text={response.synthesis} />
           </div>
-          <p style={{ fontSize: 14, lineHeight: 1.8, color: 'var(--text)', whiteSpace: 'pre-wrap' }}>{response.synthesis}</p>
+          <p style={{ fontSize: 14, lineHeight: 1.8, color: 'var(--text)', whiteSpace: 'pre-wrap' }}><RichText text={response.synthesis} /></p>
         </div>
       )}
 
@@ -199,10 +263,13 @@ function SynthesisCard({ response }) {
                     {/* Main answer */}
                     {res.answer && (
                       <div>
-                        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8, gap: 8 }}>
+                          {res.agent === 'Response Generator' && (
+                            <DownloadPDFBtn text={res.answer} filename="legal-response.pdf" />
+                          )}
                           <CopyBtn text={res.answer} />
                         </div>
-                        <p style={{ fontSize: 13.5, lineHeight: 1.8, color: 'var(--text2)', whiteSpace: 'pre-wrap' }}>{res.answer}</p>
+                        <p style={{ fontSize: 13.5, lineHeight: 1.8, color: 'var(--text2)', whiteSpace: 'pre-wrap' }}><RichText text={res.answer} /></p>
                       </div>
                     )}
 
@@ -537,6 +604,449 @@ function UploadPanel({ onUploaded, docStatus }) {
   )
 }
 
+// ─── Risk Level Config ────────────────────────────────────────────────────────
+
+const RISK_LEVELS = {
+  critical: { color: '#FF3B3B', bg: 'rgba(255,59,59,0.10)', border: 'rgba(255,59,59,0.35)', badge: 'rgba(255,59,59,0.18)', dot: '#FF3B3B', label: 'CRITICAL', emoji: '🚨' },
+  high:     { color: '#FF8040', bg: 'rgba(255,128,64,0.10)', border: 'rgba(255,128,64,0.35)', badge: 'rgba(255,128,64,0.18)', dot: '#FF8040', label: 'HIGH',     emoji: '⚠️' },
+  medium:   { color: '#F5C518', bg: 'rgba(245,197,24,0.08)', border: 'rgba(245,197,24,0.30)', badge: 'rgba(245,197,24,0.15)', dot: '#F5C518', label: 'MEDIUM',   emoji: '⚡' },
+  low:      { color: '#44CC88', bg: 'rgba(68,204,136,0.08)', border: 'rgba(68,204,136,0.25)', badge: 'rgba(68,204,136,0.12)', dot: '#44CC88', label: 'LOW',      emoji: '✓'  },
+}
+
+// ─── Risk Panel ───────────────────────────────────────────────────────────────
+
+function RiskPanel({ onClose, onExplain }) {
+  const [data, setData]       = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [filter, setFilter]   = useState('all')   // 'all' | 'critical' | 'high' | 'medium' | 'low'
+  const [expanded, setExpanded] = useState({})
+
+  useEffect(() => {
+    setLoading(true)
+    fetch(`${API}/risks`)
+      .then(r => r.json())
+      .then(d => { setData(d); setLoading(false) })
+      .catch(() => { setData({ success: false, error: 'Could not connect to server.' }); setLoading(false) })
+  }, [])
+
+  const toggle = (i) => setExpanded(p => ({ ...p, [i]: !p[i] }))
+
+  const risks = data?.risks || []
+  const visible = filter === 'all' ? risks : risks.filter(r => r.risk_level === filter)
+  const counts  = data?.counts || { critical: 0, high: 0, medium: 0, low: 0 }
+  const MONO = { fontFamily: "'JetBrains Mono',monospace" }
+
+  return (
+    <div style={{
+      width: 480, flexShrink: 0,
+      borderLeft: '1px solid var(--border)',
+      background: 'var(--bg2)',
+      display: 'flex', flexDirection: 'column',
+      overflow: 'hidden',
+      animation: 'slideInRight 0.22s ease',
+    }}>
+      {/* Header */}
+      <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', flexShrink: 0, background: 'rgba(255,128,64,0.04)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+          <div style={{ width: 30, height: 30, borderRadius: 8, background: 'rgba(255,128,64,0.12)', border: '1px solid rgba(255,128,64,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Shield size={14} style={{ color: 'var(--orange)' }} />
+          </div>
+          <div>
+            <div style={{ ...MONO, fontSize: 12, color: 'var(--orange)', letterSpacing: '0.06em' }}>RISK ANALYSIS</div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', marginTop: 1 }}>
+              {loading ? 'Loading...' : `${data?.total || 0} clauses scanned`}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text3)', display: 'flex', padding: 4 }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Count pills */}
+        {!loading && data?.success && (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {['all', 'critical', 'high', 'medium', 'low'].map(lvl => {
+              const c = lvl === 'all' ? { color: 'var(--text2)', border: 'var(--border2)', bg: 'var(--surface2)' } : RISK_LEVELS[lvl]
+              const count = lvl === 'all' ? risks.length : counts[lvl] || 0
+              const isActive = filter === lvl
+              return (
+                <button key={lvl} onClick={() => setFilter(lvl)} style={{
+                  ...MONO, fontSize: 10, padding: '4px 10px', borderRadius: 20,
+                  border: `1px solid ${isActive ? c.color || c.border : 'var(--border)'}`,
+                  background: isActive ? (c.bg || 'var(--surface2)') : 'transparent',
+                  color: isActive ? (c.color || 'var(--text2)') : 'var(--text3)',
+                  cursor: 'pointer', transition: 'all 0.15s', fontWeight: isActive ? 700 : 400,
+                }}>
+                  {lvl === 'all' ? `ALL (${count})` : `${lvl.toUpperCase()} (${count})`}
+                </button>
+              )
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Risk summary bar */}
+      {!loading && data?.success && risks.length > 0 && (
+        <div style={{ padding: '10px 20px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
+          <div style={{ display: 'flex', height: 6, borderRadius: 4, overflow: 'hidden', gap: 1 }}>
+            {['critical', 'high', 'medium', 'low'].map(lvl => {
+              const pct = risks.length ? ((counts[lvl] || 0) / risks.length) * 100 : 0
+              return pct > 0 ? (
+                <div key={lvl} style={{ width: `${pct}%`, background: RISK_LEVELS[lvl].color, transition: 'width 0.4s' }} title={`${lvl}: ${counts[lvl]}`} />
+              ) : null
+            })}
+          </div>
+          <div style={{ display: 'flex', gap: 14, marginTop: 6 }}>
+            {['critical', 'high', 'medium', 'low'].map(lvl => counts[lvl] > 0 && (
+              <div key={lvl} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <div style={{ width: 6, height: 6, borderRadius: '50%', background: RISK_LEVELS[lvl].color }} />
+                <span style={{ ...MONO, fontSize: 9.5, color: RISK_LEVELS[lvl].color }}>{counts[lvl]} {lvl}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Executive summary */}
+      {!loading && data?.summary && (
+        <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border)', background: 'rgba(255,128,64,0.04)', flexShrink: 0 }}>
+          <div style={{ ...MONO, fontSize: 9.5, color: 'var(--orange)', letterSpacing: '0.07em', marginBottom: 5 }}>EXECUTIVE SUMMARY</div>
+          <p style={{ fontSize: 12.5, color: 'var(--text2)', lineHeight: 1.7 }}>{data.summary}</p>
+        </div>
+      )}
+
+      {/* Risk list — BLOCK layout (not flex column) so cards never get height-squished */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px' }}>
+        {loading && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {[1,2,3,4].map(i => (
+              <div key={i} style={{ height: 72, borderRadius: 10, background: 'var(--surface)', border: '1px solid var(--border)', animation: 'blink 1.2s infinite', animationDelay: `${i*0.1}s` }} />
+            ))}
+          </div>
+        )}
+
+        {!loading && !data?.success && (
+          <div style={{ textAlign: 'center', padding: 40, color: 'var(--red)', fontSize: 13 }}>
+            {data?.error || 'Failed to load risks.'}
+          </div>
+        )}
+
+        {!loading && data?.success && visible.length === 0 && (
+          <div style={{ textAlign: 'center', padding: 40 }}>
+            <div style={{ fontSize: 28, marginBottom: 10 }}>✓</div>
+            <div style={{ color: 'var(--green)', ...MONO, fontSize: 12 }}>
+              {risks.length === 0 ? 'No risks scanned yet. Upload a document first.' : `No ${filter} risks found.`}
+            </div>
+          </div>
+        )}
+
+        {!loading && data?.success && visible.map((risk, i) => {
+          const lvl   = risk.risk_level || 'low'
+          const cfg   = RISK_LEVELS[lvl] || RISK_LEVELS.low
+          const open  = expanded[i] !== false  // default open for critical/high
+          const types = (risk.risk_types || []).join(', ') || 'general'
+
+          return (
+            <div key={`${filter}-${i}`} style={{
+              marginBottom: 8,
+              border: `1px solid ${cfg.border}`,
+              borderRadius: 10,
+              background: cfg.bg,
+              transition: 'all 0.2s',
+            }}>
+              {/* Card header */}
+              <div
+                onClick={() => toggle(i)}
+                style={{ padding: '12px 14px', cursor: 'pointer', display: 'flex', alignItems: 'flex-start', gap: 10, minHeight: 48 }}>
+                {/* Level badge */}
+                <div style={{
+                  flexShrink: 0, marginTop: 1,
+                  background: cfg.badge,
+                  border: `1px solid ${cfg.border}`,
+                  borderRadius: 6,
+                  padding: '2px 7px',
+                  display: 'flex', alignItems: 'center', gap: 4,
+                }}>
+                  <div style={{ width: 5, height: 5, borderRadius: '50%', background: cfg.color }} />
+                  <span style={{ ...MONO, fontSize: 9, color: cfg.color, fontWeight: 700, letterSpacing: '0.06em' }}>{cfg.label}</span>
+                </div>
+
+                {/* Summary */}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <p style={{ fontSize: 13, color: 'var(--text)', lineHeight: 1.55, fontWeight: 500, marginBottom: 3 }}>
+                    {risk.summary || 'Risk identified'}
+                  </p>
+                  <div style={{ ...MONO, fontSize: 10, color: 'var(--text3)' }}>{types}</div>
+                </div>
+
+                {/* Chevron */}
+                {open
+                  ? <ChevronUp size={13} style={{ color: 'var(--text3)', flexShrink: 0, marginTop: 2 }} />
+                  : <ChevronDown size={13} style={{ color: 'var(--text3)', flexShrink: 0, marginTop: 2 }} />
+                }
+              </div>
+
+              {/* Expanded body */}
+              {open && (
+                <div style={{ padding: '12px 14px 14px', borderTop: `1px solid ${cfg.border}`, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {/* Clause excerpt */}
+                  {risk.clause_text && (
+                    <div style={{ background: 'rgba(0,0,0,0.2)', borderRadius: 7, padding: '8px 11px', border: '1px solid var(--border)' }}>
+                      <div style={{ ...MONO, fontSize: 9.5, color: 'var(--text3)', letterSpacing: '0.06em', marginBottom: 5 }}>CLAUSE EXCERPT</div>
+                      <p style={{ fontSize: 12, color: 'var(--text3)', lineHeight: 1.65, fontStyle: 'italic' }}>
+                        "{(risk.clause_text || '').slice(0, 220)}{risk.clause_text?.length > 220 ? '...' : ''}"
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Recommendation */}
+                  {risk.recommendation && (
+                    <div style={{ background: 'rgba(0,0,0,0.15)', borderRadius: 7, padding: '8px 11px', border: `1px solid ${cfg.border}` }}>
+                      <div style={{ ...MONO, fontSize: 9.5, color: cfg.color, letterSpacing: '0.06em', marginBottom: 5 }}>RECOMMENDATION</div>
+                      <p style={{ fontSize: 12.5, color: 'var(--text2)', lineHeight: 1.65 }}>{risk.recommendation}</p>
+                    </div>
+                  )}
+
+                  {/* Explain button */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onExplain(`Explain this legal risk in plain English and what it means for me: "${risk.summary}"`)
+                    }}
+                    style={{
+                      alignSelf: 'flex-start',
+                      background: cfg.badge, border: `1px solid ${cfg.border}`,
+                      borderRadius: 7, padding: '6px 14px', cursor: 'pointer',
+                      display: 'flex', alignItems: 'center', gap: 6,
+                      color: cfg.color, ...MONO, fontSize: 11, fontWeight: 600,
+                      transition: 'all 0.15s',
+                    }}
+                    onMouseEnter={e => e.currentTarget.style.opacity = '0.75'}
+                    onMouseLeave={e => e.currentTarget.style.opacity = '1'}
+                  >
+                    <Brain size={11} /> Explain this risk
+                  </button>
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ─── Analysis Panel ───────────────────────────────────────────────────────────
+
+function AnalysisPanel({ onClose, onAsk }) {
+  const [data, setData]       = useState(null)
+  const [loading, setLoading] = useState(true)
+  const MONO = { fontFamily: "'JetBrains Mono',monospace" }
+
+  useEffect(() => {
+    setLoading(true)
+    fetch(`${API}/analysis`)
+      .then(r => r.json())
+      .then(d => { setData(d); setLoading(false) })
+      .catch(() => { setData({ success: false, error: 'Could not connect to server.' }); setLoading(false) })
+  }, [])
+
+  const totalRisks = data
+    ? (data.risk_distribution?.critical || 0) + (data.risk_distribution?.high || 0) +
+      (data.risk_distribution?.medium || 0)  + (data.risk_distribution?.low || 0)
+    : 0
+
+  const overallRisk = () => {
+    if (!data?.risk_distribution) return null
+    const { critical, high, medium } = data.risk_distribution
+    if (critical > 0) return { label: 'HIGH RISK', color: '#FF3B3B', bg: 'rgba(255,59,59,0.1)' }
+    if (high > 2)     return { label: 'ELEVATED RISK', color: '#FF8040', bg: 'rgba(255,128,64,0.1)' }
+    if (medium > 3)   return { label: 'MODERATE RISK', color: '#F5C518', bg: 'rgba(245,197,24,0.08)' }
+    return              { label: 'LOW RISK', color: '#44CC88', bg: 'rgba(68,204,136,0.08)' }
+  }
+
+  const risk = overallRisk()
+
+  const QUICK_QUESTIONS = [
+    { text: 'What are the biggest risks I should know about?', intent: 'risk' },
+    { text: 'Summarize this document in simple terms', intent: 'simplify' },
+    { text: 'What clauses should I negotiate or remove?', intent: 'risk' },
+    { text: 'Explain the indemnification and liability clauses', intent: 'simplify' },
+  ]
+
+  return (
+    <div style={{
+      width: 480, flexShrink: 0,
+      borderLeft: '1px solid var(--border)',
+      background: 'var(--bg2)',
+      display: 'flex', flexDirection: 'column',
+      overflow: 'hidden',
+      animation: 'slideInRight 0.22s ease',
+    }}>
+      {/* Header */}
+      <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', flexShrink: 0, background: 'rgba(0,212,255,0.03)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ width: 30, height: 30, borderRadius: 8, background: 'rgba(0,212,255,0.10)', border: '1px solid rgba(0,212,255,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <BarChart2 size={14} style={{ color: 'var(--cyan)' }} />
+          </div>
+          <div>
+            <div style={{ ...MONO, fontSize: 12, color: 'var(--cyan)', letterSpacing: '0.06em' }}>DOCUMENT ANALYSIS</div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', marginTop: 1 }}>
+              {loading ? 'Loading...' : data?.success ? 'Overview of your document' : 'No document loaded'}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text3)', display: 'flex', padding: 4 }}>
+            <X size={16} />
+          </button>
+        </div>
+      </div>
+
+      <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+        {loading && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {[1,2,3].map(i => <div key={i} style={{ height: 90, borderRadius: 10, background: 'var(--surface)', border: '1px solid var(--border)', animation: 'blink 1.2s infinite', animationDelay: `${i*0.15}s` }} />)}
+          </div>
+        )}
+
+        {!loading && !data?.success && (
+          <div style={{ textAlign: 'center', padding: 40 }}>
+            <Upload size={32} style={{ color: 'var(--text3)', marginBottom: 12 }} />
+            <div style={{ color: 'var(--text3)', fontSize: 13 }}>Upload a document to see analysis</div>
+          </div>
+        )}
+
+        {!loading && data?.success && (
+          <>
+            {/* Overall verdict */}
+            {risk && (
+              <div style={{ background: risk.bg, border: `1px solid ${risk.color}44`, borderRadius: 12, padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 14 }}>
+                <div style={{ width: 44, height: 44, borderRadius: 10, background: `${risk.color}18`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <AlertTriangle size={20} style={{ color: risk.color }} />
+                </div>
+                <div>
+                  <div style={{ ...MONO, fontSize: 9.5, color: risk.color, letterSpacing: '0.07em', marginBottom: 3 }}>OVERALL ASSESSMENT</div>
+                  <div style={{ fontSize: 17, fontWeight: 700, color: risk.color }}>{risk.label}</div>
+                  {data.risk_summary && (
+                    <p style={{ fontSize: 12, color: 'var(--text2)', marginTop: 5, lineHeight: 1.6 }}>{data.risk_summary}</p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Stats row */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+              {[
+                { label: 'CLAUSES', value: data.clause_count, color: 'var(--cyan)', icon: Layers },
+                { label: 'RISKS FOUND', value: totalRisks, color: 'var(--orange)', icon: AlertTriangle },
+                { label: 'DOCUMENTS', value: data.documents?.length || 0, color: 'var(--gold)', icon: FileText },
+              ].map(({ label, value, color, icon: Icon }) => (
+                <div key={label} style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', textAlign: 'center' }}>
+                  <Icon size={16} style={{ color, marginBottom: 6 }} />
+                  <div style={{ fontSize: 22, fontWeight: 700, color, lineHeight: 1 }}>{value}</div>
+                  <div style={{ ...MONO, fontSize: 9, color: 'var(--text3)', marginTop: 4, letterSpacing: '0.05em' }}>{label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Docs indexed */}
+            {data.documents?.length > 0 && (
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px' }}>
+                <div style={{ ...MONO, fontSize: 10, color: 'var(--text3)', letterSpacing: '0.07em', marginBottom: 8 }}>INDEXED DOCUMENTS</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                  {data.documents.map((doc, i) => {
+                    const name = doc.split('/').pop().split('\\').pop()
+                    return (
+                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <FileText size={11} style={{ color: 'var(--gold)', flexShrink: 0 }} />
+                        <span style={{ fontSize: 12.5, color: 'var(--text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+                        <CheckCircle size={11} style={{ color: 'var(--green)', flexShrink: 0, marginLeft: 'auto' }} />
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Risk distribution */}
+            {totalRisks > 0 && (
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px' }}>
+                <div style={{ ...MONO, fontSize: 10, color: 'var(--text3)', letterSpacing: '0.07em', marginBottom: 10 }}>RISK DISTRIBUTION</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                  {['critical', 'high', 'medium', 'low'].map(lvl => {
+                    const count = data.risk_distribution[lvl] || 0
+                    const pct = totalRisks ? (count / totalRisks) * 100 : 0
+                    const cfg = RISK_LEVELS[lvl]
+                    return (
+                      <div key={lvl}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                          <span style={{ ...MONO, fontSize: 10, color: cfg.color }}>{lvl.toUpperCase()}</span>
+                          <span style={{ ...MONO, fontSize: 10, color: 'var(--text3)' }}>{count}</span>
+                        </div>
+                        <div style={{ height: 5, borderRadius: 3, background: 'var(--border2)' }}>
+                          <div style={{ height: '100%', width: `${pct}%`, borderRadius: 3, background: cfg.color, transition: 'width 0.5s ease' }} />
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Clause type breakdown */}
+            {Object.keys(data.clause_types || {}).length > 0 && (
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px' }}>
+                <div style={{ ...MONO, fontSize: 10, color: 'var(--text3)', letterSpacing: '0.07em', marginBottom: 10 }}>CLAUSE TYPES DETECTED</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {Object.entries(data.clause_types).slice(0, 16).map(([type, count]) => (
+                    <div key={type} style={{
+                      display: 'flex', alignItems: 'center', gap: 5,
+                      background: 'rgba(201,168,76,0.07)', border: '1px solid rgba(201,168,76,0.2)',
+                      borderRadius: 20, padding: '3px 10px',
+                    }}>
+                      <span style={{ fontSize: 12, color: 'var(--text2)', textTransform: 'capitalize' }}>{type}</span>
+                      <span style={{ ...MONO, fontSize: 9.5, color: 'var(--gold)', fontWeight: 700 }}>{count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Scan status */}
+            <div style={{ ...MONO, fontSize: 10.5, color: data.scan_done ? 'var(--green)' : data.scan_running ? 'var(--orange)' : 'var(--text3)', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div style={{ width: 6, height: 6, borderRadius: '50%', background: data.scan_done ? 'var(--green)' : data.scan_running ? 'var(--orange)' : 'var(--border2)', animation: data.scan_running ? 'blink 0.8s infinite' : 'none' }} />
+              {data.scan_done ? 'Full risk scan complete' : data.scan_running ? 'Risk scan in progress...' : 'No risk scan yet'}
+            </div>
+
+            {/* Quick action prompts */}
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px' }}>
+              <div style={{ ...MONO, fontSize: 10, color: 'var(--text3)', letterSpacing: '0.07em', marginBottom: 10 }}>QUICK QUESTIONS</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {QUICK_QUESTIONS.map((q, i) => {
+                  const c = INTENT_COLORS[q.intent]
+                  return (
+                    <button key={i}
+                      onClick={() => { onAsk(q.text); onClose() }}
+                      style={{
+                        background: 'var(--bg2)', border: '1px solid var(--border)',
+                        borderRadius: 8, padding: '9px 12px', cursor: 'pointer', textAlign: 'left',
+                        display: 'flex', alignItems: 'center', gap: 8, transition: 'all 0.15s',
+                      }}
+                      onMouseEnter={e => { e.currentTarget.style.borderColor = c.border; e.currentTarget.style.background = c.bg }}
+                      onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.background = 'var(--bg2)' }}>
+                      <ChevronRight size={11} style={{ color: c.color, flexShrink: 0 }} />
+                      <span style={{ fontSize: 12.5, color: 'var(--text2)', lineHeight: 1.4 }}>{q.text}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── Main page ───────────────────────────────────────────────────────────────
 
 export default function Home() {
@@ -548,6 +1058,7 @@ export default function Home() {
   const [serverStatus, setServerStatus] = useState(null)
   const [docStatus, setDocStatus] = useState({ ready: false, clauseCount: 0, docs: [] })
   const [sidebarTab, setSidebarTab] = useState('upload') // 'upload' | 'agents' | 'info'
+  const [activePanel, setActivePanel] = useState(null)  // 'risk' | 'analysis' | null
   const messagesEndRef = useRef()
   const textareaRef = useRef()
 
@@ -635,11 +1146,36 @@ export default function Home() {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
   }
 
+  // Send a question from the panel into the chatbox and close panel
+  const explainRisk = async (text) => {
+    setActivePanel(null)
+    if (!text?.trim()) return
+    setLoading(true)
+    resetAgents()
+    const uid = Date.now().toString()
+    setMessages(prev => [...prev, { id: uid, role: 'user', content: text, timestamp: new Date() }])
+    const lid = uid + '_loading'
+    setMessages(prev => [...prev, { id: lid, role: 'assistant', loading: true, loadingText: 'Analysing risk...', timestamp: new Date() }])
+    try {
+      const res = await fetch(`${API}/ask`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: text, tone }) })
+      const data = await res.json()
+      const usedAgents = data.agents_used || []
+      usedAgents.forEach(name => setAgentStates(prev => ({ ...prev, [name]: 'running' })))
+      await new Promise(r => setTimeout(r, 600))
+      usedAgents.forEach(name => setAgentStates(prev => ({ ...prev, [name]: 'done' })))
+      setMessages(prev => prev.map(m => m.id === lid ? { id: lid, role: 'assistant', content: data.synthesis || data.error || 'No response.', response: data.success ? data : null, timestamp: new Date() } : m))
+      if (data.success) { setSidebarTab('agents'); await fetchStatus() }
+    } catch (e) {
+      setMessages(prev => prev.map(m => m.id === lid ? { id: lid, role: 'assistant', content: `Connection error: ${e.message}`, timestamp: new Date() } : m))
+    }
+    setLoading(false)
+  }
+
   const online = serverStatus?.status === 'online'
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <div className="grid-bg" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+    <div className="grid-bg" style={{ height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
 
       {/* ── Top bar ── */}
       <header style={{ background: 'rgba(7,9,15,0.9)', backdropFilter: 'blur(12px)', borderBottom: '1px solid var(--border)', padding: '0 28px', height: 58, display: 'flex', alignItems: 'center', gap: 20, position: 'sticky', top: 0, zIndex: 100 }}>
@@ -660,13 +1196,23 @@ export default function Home() {
         {/* Nav pills */}
         <div style={{ display: 'flex', gap: 4 }}>
           {[
-            { label: 'ANALYSIS', icon: Brain },
-            { label: 'RISK', icon: Shield },
-            { label: 'DOCUMENTS', icon: FileText },
-          ].map(({ label, icon: Icon }) => (
-            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '5px 12px', borderRadius: 7, fontFamily: "'JetBrains Mono',monospace", fontSize: 10.5, color: 'var(--text3)', cursor: 'default', letterSpacing: '0.05em' }}>
+            { label: 'ANALYSIS', icon: Brain, panel: 'analysis' },
+            { label: 'RISK', icon: Shield, panel: 'risk' },
+          ].map(({ label, icon: Icon, panel }) => (
+            <button
+              key={label}
+              onClick={() => setActivePanel(p => p === panel ? null : panel)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6, padding: '5px 12px', borderRadius: 7,
+                fontFamily: "'JetBrains Mono',monospace", fontSize: 10.5, letterSpacing: '0.05em',
+                cursor: 'pointer', border: '1px solid',
+                borderColor: activePanel === panel ? (panel === 'risk' ? 'rgba(255,128,64,0.5)' : 'rgba(0,212,255,0.5)') : 'transparent',
+                color: activePanel === panel ? (panel === 'risk' ? 'var(--orange)' : 'var(--cyan)') : 'var(--text3)',
+                background: activePanel === panel ? (panel === 'risk' ? 'rgba(255,128,64,0.08)' : 'rgba(0,212,255,0.08)') : 'transparent',
+                transition: 'all 0.2s',
+              }}>
               <Icon size={11} /> {label}
-            </div>
+            </button>
           ))}
         </div>
 
@@ -699,13 +1245,13 @@ export default function Home() {
       </header>
 
       {/* ── Main layout ── */}
-      <div style={{ flex: 1, display: 'flex', height: 'calc(100vh - 58px)' }}>
+      <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
 
         {/* ── Left sidebar — fixed height, only inner content scrolls ── */}
-        <aside style={{ width: 300, flexShrink: 0, borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: 'var(--bg2)', position: 'sticky', top: 0 }}>
+        <aside style={{ width: 300, flexShrink: 0, borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg2)' }}>
 
-          {/* Sidebar tabs */}
-          <div style={{ display: 'flex', borderBottom: '1px solid var(--border)', background: 'var(--bg)' }}>
+          {/* Sidebar tabs — pinned at top, never scrolls */}
+          <div style={{ display: 'flex', borderBottom: '1px solid var(--border)', background: 'var(--bg)', flexShrink: 0 }}>
             {[
               { id: 'upload', label: 'UPLOAD', icon: Upload },
               { id: 'agents', label: 'AGENTS', icon: Activity },
@@ -808,10 +1354,11 @@ export default function Home() {
         </aside>
 
         {/* ── Chat area — messages scroll, input stays fixed ── */}
-        <main style={{ flex: 1, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', minWidth: 0 }}>
+        <main style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0, minHeight: 0 }}>
 
           {/* Messages — only this scrolls */}
-          <div className="scan-wrap" style={{ flex: 1, overflowY: 'auto', padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 20 }}>
+          <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
+            <div className="scan-wrap" style={{ flex: 1, overflowY: 'auto', padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 20 }}>
 
             {/* Empty state */}
             {messages.length === 0 && (
@@ -890,6 +1437,21 @@ export default function Home() {
             ))}
             <div ref={messagesEndRef} />
           </div>
+
+          {/* ── Right panel: Risk or Analysis ── */}
+          {activePanel === 'risk' && (
+            <RiskPanel
+              onClose={() => setActivePanel(null)}
+              onExplain={explainRisk}
+            />
+          )}
+          {activePanel === 'analysis' && (
+            <AnalysisPanel
+              onClose={() => setActivePanel(null)}
+              onAsk={explainRisk}
+            />
+          )}
+          </div>  {/* end flex row wrapper */}
 
           {/* ── Input bar — sticky at bottom, never scrolls ── */}
           <div style={{ borderTop: '1px solid var(--border)', padding: '16px 28px 20px', background: 'rgba(7,9,15,0.95)', backdropFilter: 'blur(16px)', flexShrink: 0, zIndex: 10 }}>
@@ -975,5 +1537,3 @@ export default function Home() {
     </div>
   )
 }
-
-

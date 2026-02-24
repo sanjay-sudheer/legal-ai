@@ -800,6 +800,151 @@ def scan_status():
     })
 
 
+@app.route("/risks", methods=["GET"])
+def get_risks():
+    """
+    GET /risks
+    Returns all cached risks from the background scan, sorted by severity.
+    Used by the frontend Risk panel to display all risks with colour coding.
+
+    Response JSON:
+      success      : bool
+      risks        : list[dict]  — all risk entries, sorted critical → low
+      counts       : dict        — { critical, high, medium, low }
+      total        : int
+      scan_done    : bool
+      scan_running : bool
+      summary      : str         — executive summary from scan
+    """
+    try:
+        if not os.path.exists(RISK_CACHE_FILE):
+            with _scan_lock:
+                running = _scan_state["running"]
+            return jsonify({
+                "success": True,
+                "risks": [],
+                "counts": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+                "total": 0,
+                "scan_done": False,
+                "scan_running": running,
+                "summary": "",
+            })
+
+        agent        = _make_risk()
+        cached_risks = list(agent.cache._data.values())
+
+        ORDER = {"critical": 3, "high": 2, "medium": 1, "low": 0}
+        cached_risks.sort(key=lambda r: ORDER.get(r.get("risk_level", "low"), 0), reverse=True)
+
+        counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for r in cached_risks:
+            lvl = r.get("risk_level", "low")
+            counts[lvl] = counts.get(lvl, 0) + 1
+
+        # Clean up each risk entry for frontend consumption
+        risks_out = []
+        for r in cached_risks:
+            risks_out.append({
+                "risk_level":      r.get("risk_level", "low"),
+                "summary":         r.get("summary", ""),
+                "recommendation":  r.get("recommendation", ""),
+                "risk_types":      r.get("risk_types", []),
+                "clause_text":     r.get("clause_text", "")[:400],  # truncate for UI
+            })
+
+        with _scan_lock:
+            state = dict(_scan_state)
+
+        return jsonify({
+            "success":      True,
+            "risks":        risks_out,
+            "counts":       counts,
+            "total":        len(cached_risks),
+            "scan_done":    state["done"],
+            "scan_running": state["running"],
+            "summary":      state.get("summary", ""),
+        })
+
+    except Exception as e:
+        logger.error(f"GET /risks error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+ANALYSIS_PROMPT = """You are a senior legal analyst. Based on the document clauses and risk scan below, provide a structured overview of this legal document for a non-lawyer.
+
+Document clauses sample:
+{clauses}
+
+Risk scan summary:
+{risk_summary}
+
+Return a JSON object with EXACTLY these fields (no markdown, no code fences, just raw JSON):
+{{
+  "document_type": "e.g. Employment Contract / NDA / Service Agreement / Summons etc.",
+  "parties": ["Party A name", "Party B name"],
+  "purpose": "1-2 sentence plain English summary of what this document is about",
+  "key_obligations": ["obligation 1", "obligation 2", "obligation 3"],
+  "key_rights": ["right 1", "right 2"],
+  "duration": "contract term or N/A",
+  "governing_law": "jurisdiction or N/A",
+  "overall_risk_level": "low | medium | high | critical",
+  "risk_summary": "2-3 sentence plain English risk overview",
+  "action_items": ["urgent action 1", "action 2"],
+  "plain_summary": "3-4 sentence plain English summary a non-lawyer would understand"
+}}"""
+
+
+@app.route("/analysis", methods=["GET"])
+def get_analysis():
+    """
+    GET /analysis
+    Returns a document overview: clause types, risk distribution, scan status.
+    Used by the ANALYSIS panel in the frontend.
+    """
+    try:
+        if not _db_ready():
+            return jsonify({
+                "success": False, "error": "No documents ingested yet.",
+                "clause_count": 0, "documents": [], "clause_types": {},
+                "risk_distribution": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+                "risk_summary": "", "scan_done": False, "scan_running": False,
+            })
+
+        metadata     = json.load(open(METADATA_PATH))
+        clause_count = len(metadata)
+
+        type_counts = {}
+        for clause in metadata:
+            for t in (clause.get("legal_types") or []):
+                t = t.strip().lower()
+                if t:
+                    type_counts[t] = type_counts.get(t, 0) + 1
+        type_counts = dict(sorted(type_counts.items(), key=lambda x: x[1], reverse=True))
+
+        risk_dist = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        if os.path.exists(RISK_CACHE_FILE):
+            agent  = _make_risk()
+            cached = list(agent.cache._data.values())
+            for r in cached:
+                lvl = r.get("risk_level", "low")
+                risk_dist[lvl] = risk_dist.get(lvl, 0) + 1
+
+        with _scan_lock:
+            risk_summary = _scan_state.get("summary", "")
+            scan_done    = _scan_state.get("done", False)
+            scan_running = _scan_state.get("running", False)
+
+        return jsonify({
+            "success": True, "clause_count": clause_count,
+            "documents": _doc_sources(), "clause_types": type_counts,
+            "risk_distribution": risk_dist, "risk_summary": risk_summary,
+            "scan_done": scan_done, "scan_running": scan_running,
+        })
+    except Exception as e:
+        logger.error(f"Analysis endpoint error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # ── Entry point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("\n" + "=" * 60)
