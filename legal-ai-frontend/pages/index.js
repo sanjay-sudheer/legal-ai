@@ -811,7 +811,23 @@ function RiskPanel({ onClose, onExplain }) {
                   <button
                     onClick={(e) => {
                       e.stopPropagation()
-                      onExplain(`Explain this legal risk in plain English and what it means for me: "${risk.summary}"`)
+                      // Build a rich grounded query that includes all risk details so the
+                      // vector DB has real clause language to search against — not just a label
+                      const parts = [
+                        `Explain this ${(risk.risk_level || 'legal').toUpperCase()} risk to me in plain English and what it means for me.`,
+                        `Risk identified: "${risk.summary}"`,
+                      ]
+                      if (risk.risk_types?.length > 0) {
+                        parts.push(`Risk category: ${risk.risk_types.join(', ')}.`)
+                      }
+                      if (risk.clause_text) {
+                        parts.push(`This risk comes from the following clause in the document: "${risk.clause_text}"`)
+                      }
+                      if (risk.recommendation) {
+                        parts.push(`Suggested action: ${risk.recommendation}`)
+                      }
+                      parts.push('Please explain: (1) what this clause means in simple language, (2) what real-world risk it creates for me, (3) what could go wrong if I ignore it, and (4) what I should do about it.')
+                      onExplain(parts.join(' '))
                     }}
                     style={{
                       alignSelf: 'flex-start',
