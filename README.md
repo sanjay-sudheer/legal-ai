@@ -96,7 +96,7 @@ lexai/
 
 ```bash
 git clone https://github.com/sanjay-sudheer/legal-ai.git
-cd lexai
+cd legal-ai
 ```
 
 ### 2. Backend setup
