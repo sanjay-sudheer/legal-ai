@@ -95,7 +95,7 @@ lexai/
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/yourusername/lexai.git
+git clone https://github.com/sanjay-sudheer/legal-ai.git
 cd lexai
 ```
 
