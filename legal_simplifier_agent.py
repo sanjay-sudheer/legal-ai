@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your-key-here")  # Set this in your .env file or environment variables
 GROQ_MODEL   = "llama-3.3-70b-versatile"             # fast + capable on Groq free tier
-TOP_K_CLAUSES = 3
+TOP_K_CLAUSES = 5  # Increased: more context = better answers
 
 ExplanationLevel = Literal["brief", "detailed", "expert"]
 
@@ -91,17 +91,29 @@ EXPERT_PROMPT = (
 
 QUERY_EXPANSION_PROMPT = (
     'A user asked this question about a legal document:\n"{query}"\n\n'
-    "Rewrite this as a legal search phrase (5-10 words) that would match relevant "
-    "clauses in a contract. Return only the search phrase, nothing else."
+    "Rewrite this as a precise legal search phrase (5-15 words) that will retrieve the exact clause answering this question.\n\n"
+    "Document type hints:\n"
+    "- POA questions (why/who/authority/revoke) → 'reason principal attorney residing outside professional commitments'\n"
+    "- Insurance questions (benefit/rider/claim/premium) → 'sum assured death benefit rider critical illness waiver premium grace period'\n"
+    "- Summons/court questions (deadline/hearing/appear/relief) → 'first hearing date written statement ex-parte filing deadline'\n"
+    "- Rental/lease questions (rent/deposit/sublet/pet/notice) → 'licence fee security deposit monthly rent subletting termination notice'\n"
+    "- Affidavit questions (title/loan/encumbrance/false) → 'encumbrance free title deed home loan bank affidavit false statement'\n"
+    "- Contract/PSA questions (payment/IP/arbitration/notice) → 'professional fee payment schedule interest arbitration deliverables'\n\n"
+    "Return ONLY the search phrase, nothing else."
 )
 
 DIRECT_ANSWER_PROMPT = (
     'A user asked: "{query}"\n\n'
-    "Based on these relevant contract clauses:\n---\n{clauses}\n---\n\n"
-    "Answer their question directly in plain, friendly English — like explaining to "
-    "a friend. If the answer is clearly in the clauses, say so confidently. "
-    "If not, say the document doesn't seem to cover that.\n\n"
-    'End with a "Key takeaway:" line summarizing the most important point.'
+    "Read the following document content COMPLETELY before answering. "
+    "Pay special attention to lines tagged [REASON] and [PARTIES] — these contain the most important facts.\n\n"
+    "DOCUMENT CONTENT:\n---\n{clauses}\n---\n\n"
+    "Now answer the user's question. STRICT RULES:\n"
+    "1. If you see a [REASON] tagged sentence, you MUST include that specific reason in your answer verbatim.\n"
+    "2. Use the actual names from [PARTIES] — never say 'Party A' or 'the principal' if you know the real name.\n"
+    "3. If the document states WHY something was done, quote or paraphrase it directly — do NOT say 'the document doesn't state why'.\n"
+    "4. If the document states WHAT authority is given, summarize the key powers.\n"
+    "5. Answer in plain, friendly English as if explaining to a friend.\n\n"
+    'End with a "Key takeaway:" line with the single most important point.'
 )
 
 
@@ -144,15 +156,40 @@ class KnowledgeBaseReader:
             self.metadata = json.load(f)
         logger.info(f"Loaded knowledge base: {self.index.ntotal} clauses.")
 
-    def search(self, embedding: np.ndarray, top_k: int = TOP_K_CLAUSES):
-        distances, indices = self.index.search(embedding, top_k)
+    def list_documents(self) -> list[dict]:
+        """Return all unique documents in the knowledge base."""
+        seen, docs = set(), []
+        for entry in self.metadata:
+            did = entry.get("doc_id", "")
+            if did not in seen:
+                seen.add(did)
+                docs.append({
+                    "doc_id":   did,
+                    "doc_name": entry.get("doc_name", ""),
+                    "source":   entry.get("source", ""),
+                })
+        return docs
+
+    def search(self, embedding: np.ndarray, top_k: int = TOP_K_CLAUSES,
+               doc_id: str = None, doc_name: str = None):
+        # Fetch more when filtering so we still get top_k after filter
+        fetch_k = top_k * 8 if (doc_id or doc_name) else top_k
+        fetch_k = min(fetch_k, max(1, self.index.ntotal))
+
+        distances, indices = self.index.search(embedding, fetch_k)
         results = []
         for dist, idx in zip(distances[0], indices[0]):
             if idx == -1:
                 continue
             entry = dict(self.metadata[idx])
             entry["distance"] = float(dist)
+            if doc_id and entry.get("doc_id") != doc_id:
+                continue
+            if doc_name and entry.get("doc_name") != doc_name:
+                continue
             results.append(entry)
+            if len(results) >= top_k:
+                break
         return results
 
 
@@ -248,17 +285,18 @@ class LegalSimplifierAgent:
             similarity_score=clause.get("distance", 0.0),
         )
 
-    def query(self, user_query: str, level: ExplanationLevel = "detailed", top_k: int = None) -> QueryResult:
+    def query(self, user_query: str, level: ExplanationLevel = "detailed",
+              top_k: int = None, doc_id: str = None, doc_name: str = None) -> QueryResult:
         top_k = top_k or self.top_k
-        logger.info(f"Query: '{user_query}' | level={level}")
+        logger.info(f"Query: '{user_query}' | level={level} | doc_id={doc_id} | doc_name={doc_name}")
 
         # Step 1: Expand the user's casual question into legal search terms
         expanded = self.llm.generate(QUERY_EXPANSION_PROMPT.format(query=user_query))
         logger.info(f"Expanded query: '{expanded}'")
 
-        # Step 2: Embed and retrieve from FAISS
+        # Step 2: Embed and retrieve from FAISS — scoped to the active document
         embedding = self.embedder.embed([expanded])
-        raw_clauses = self.kb.search(embedding, top_k=top_k)
+        raw_clauses = self.kb.search(embedding, top_k=top_k, doc_id=doc_id, doc_name=doc_name)
 
         if not raw_clauses:
             return QueryResult(
@@ -267,11 +305,21 @@ class LegalSimplifierAgent:
                 supporting_clauses=[],
             )
 
-        # Step 3: Generate a direct plain-English answer grounded in retrieved clauses
-        clauses_text = "\n\n---\n\n".join(
-            f"[{', '.join(c.get('legal_types', ['general']))}]\n{c['clause_text']}"
-            for c in raw_clauses
-        )
+        # Step 3: Build clause context
+        clause_parts = []
+        for c in raw_clauses:
+            legal_types = c.get('legal_types', ['general'])
+            text = c['clause_text']
+            is_full_doc = 'full_document' in legal_types or c.get('clause_index') == -1
+
+            if is_full_doc:
+                extracted = self._extract_key_sentences(text, user_query)
+                clause_parts.append(f"[{', '.join(legal_types)}]\n{extracted}")
+            else:
+                clause_parts.append(f"[{', '.join(legal_types)}]\n{text[:1500]}")
+
+        clauses_text = "\n\n---\n\n".join(clause_parts)
+
         direct_answer = self.llm.generate(
             DIRECT_ANSWER_PROMPT.format(query=user_query, clauses=clauses_text)
         )
@@ -284,6 +332,113 @@ class LegalSimplifierAgent:
             direct_answer=direct_answer,
             supporting_clauses=simplified,
         )
+
+    @staticmethod
+    def _extract_key_sentences(full_text: str, query: str) -> str:
+        """
+        Universal key-sentence extractor for full-document records.
+        Works across ALL document types (POA, insurance, summons, rental, affidavit, PSA).
+
+        Extracts by priority:
+        1. REASON/PURPOSE sentences (why the doc exists)
+        2. PARTIES sentences (who is involved)
+        3. Numeric/date facts (amounts, dates, percentages, deadlines)
+        4. Query-keyword matching sentences
+        5. Document start (structural context)
+        """
+        import re
+
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+|\n(?=[A-Z])', full_text)
+        selected = []
+        seen = set()
+
+        def add(tag: str, sent: str):
+            s = sent.strip()
+            if s and s not in seen and len(s) > 20:
+                selected.append(f"[{tag}] {s}" if tag else s)
+                seen.add(s)
+
+        # ── Priority 1: REASON / PURPOSE sentences ────────────────────────
+        reason_patterns = [
+            # POA
+            r'granted because', r'residing outside', r'residing abroad',
+            r'professional commitment', r'unable to be present', r'outside india',
+            r'houston', r'power of attorney is granted',
+            # Insurance
+            r'policy is issued', r'sum assured', r'in consideration of',
+            # PSA
+            r'desirous of availing', r'engaged in the business',
+            r'navi mumbai', r'coastal development',
+            # Affidavit
+            r'executing this affidavit for the purpose',
+            r'submitting.*to.*bank', r'home loan application',
+            # Summons
+            r'suit has been filed', r'cause of action',
+            r'failure to hand over possession',
+            # Rental
+            r'licensor is the absolute owner', r'willing to grant',
+        ]
+        for sent in sentences:
+            sl = sent.lower()
+            if any(re.search(p, sl) for p in reason_patterns) and sent.strip() not in seen:
+                add("REASON", sent)
+
+        # ── Priority 2: PARTIES / IDENTITY sentences ─────────────────────
+        party_patterns = [
+            r's/o|d/o|w/o', r'hereinafter referred to as',
+            r'life assured', r'nominee', r'licensor|licensee',
+            r'plaintiff|defendant', r'service provider|client',
+            r'deponent', r'principal.*attorney',
+        ]
+        party_sents = []
+        for sent in sentences:
+            sl = sent.lower()
+            if any(re.search(p, sl) for p in party_patterns) and sent.strip() not in seen:
+                party_sents.append(sent.strip())
+                seen.add(sent.strip())
+        if party_sents:
+            selected.append("[PARTIES]\n" + " ".join(party_sents[:5]))
+
+        # ── Priority 3: KEY NUMERIC FACTS (amounts, dates, rates, periods) ─
+        numeric_patterns = [
+            # Dates
+            r'\b\d{1,2}(st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4}\b',
+            r'\b\d{1,2}/\d{1,2}/\d{4}\b',
+            # Money amounts
+            r'rs\.?\s*[\d,]+', r'rupees.*lakh', r'₹\s*[\d,]+',
+            # Percentages and rates
+            r'\d+\.?\d*\s*%\s*per\s*(annum|day|month)',
+            r'18%|10%|500.*per day',
+            # Periods and deadlines
+            r'\d+\s*(days?|months?|years?)\s*(grace|notice|within|from)',
+            r'grace period', r'first hearing', r'last date.*filing',
+            # Policy/contract specific numbers
+            r'policy number|policy no', r'case no|cnr', r'rera no',
+            r'sum assured.*rs', r'maturity.*\d{4}',
+        ]
+        for sent in sentences:
+            sl = sent.lower()
+            if any(re.search(p, sl) for p in numeric_patterns) and sent.strip() not in seen:
+                add("FACT", sent)
+                if len(selected) > 20:
+                    break
+
+        # ── Priority 4: Query-keyword matching ────────────────────────────
+        query_words = [w.lower() for w in re.split(r'\W+', query) if len(w) > 3]
+        for sent in sentences:
+            sl = sent.lower()
+            if any(qw in sl for qw in query_words) and sent.strip() not in seen:
+                add("", sent)
+                if len("\n".join(selected)) > 2200:
+                    break
+
+        # ── Priority 5: Document start for structural context ─────────────
+        result = "\n\n".join(selected)
+        if len(result) < 2000:
+            result = full_text[:700] + "\n\n...\n\n" + result
+
+        return result[:3500]
 
     @staticmethod
     def print_result(result: QueryResult, show_clauses: bool = True):

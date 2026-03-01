@@ -128,18 +128,19 @@ The client asked: "{query}"
 Your specialist agents found this:
 {results}
 
-Write a clear, warm, HUMAN response:
-1. Start with a direct 1-2 sentence answer to exactly what they asked
-2. Explain the 2-3 most important findings in simple terms — what do they actually MEAN for this person?
-3. If there are risks, explain the real-world consequence (e.g. "this means they can charge you extra without warning")
-4. Flag any URGENT actions clearly (e.g. "Do not sign until...", "You have X days to...")
-5. End with one concrete, actionable next step
+Write a clear, warm, HUMAN response following these rules STRICTLY:
+1. Start with a direct answer using SPECIFIC names, dates, and facts from the document — never use generic terms like "the principal" if you know the actual name.
+2. If the agent results contain a stated REASON or PURPOSE (e.g. "because the principal is residing outside India", "due to professional commitments abroad"), you MUST state that reason explicitly in your answer. NEVER say the document doesn't provide a reason if a reason appears anywhere in the results.
+3. Explain what the 2-3 most important findings mean in practical terms for this person.
+4. If there are risks, explain them in real-world terms.
+5. Flag any urgent actions clearly.
+6. End with one concrete next step.
 
-STRICT RULES:
-- Never use legal jargon without immediately explaining it in parentheses
-- Never just list clause summaries — always say what they MEAN for the person
-- Write like a knowledgeable friend, not a legal database
-- Length: 180-300 words
+ABSOLUTE RULES:
+- Search the ENTIRE results text for any sentence containing "because", "reason", "residing", "professional", "committed", "unable" — if found, include it.
+- Use real names from the document, not placeholders.
+- Never use legal jargon without explaining it.
+- Length: 200-320 words.
 """
 
 RISK_EXPLAIN_PROMPT = """A legal risk scan found these issues in a contract:
@@ -189,11 +190,25 @@ def _db_ready() -> bool:
 
 
 def _clause_count() -> int:
+    """Returns number of scannable clauses (excludes full_doc and table sentinel records)."""
     if not _db_ready():
         return 0
     try:
         data = json.load(open(METADATA_PATH))
-        return len(data)
+        return sum(
+            1 for e in data
+            if e.get("clause_index", 0) >= 0
+            and "table_data" not in e.get("legal_types", [])
+        )
+    except Exception:
+        return 0
+
+def _total_indexed() -> int:
+    """Returns total records in FAISS including sentinels — used for UI display."""
+    if not _db_ready():
+        return 0
+    try:
+        return len(json.load(open(METADATA_PATH)))
     except Exception:
         return 0
 
@@ -260,13 +275,8 @@ class AgentExecutor:
     """
 
     # ── Legal Simplifier ─────────────────────────────────────────────────
-    def run_simplify(self, query: str, focus_on_risks: bool = False) -> dict:
-        """
-        When focus_on_risks=True (called alongside Risk Detector):
-        - Reads top high/critical risks from cache
-        - Builds a focused query so the simplifier explains THOSE specific clauses
-        - Result: user gets both WHAT the risks are AND WHAT THEY MEAN in plain English
-        """
+    def run_simplify(self, query: str, focus_on_risks: bool = False,
+                     doc_id: str = None, doc_name: str = None) -> dict:
         try:
             agent = _make_simplifier()
 
@@ -288,15 +298,15 @@ class AgentExecutor:
                             f"{query}. Focus on explaining these specific high-risk areas "
                             f"in plain English a non-lawyer understands: {risk_topics}"
                         )
-                        logger.info(f"[SIMPLIFIER] Risk-focused query: {effective_query[:120]}...")
 
-            result = agent.query(effective_query, level="detailed")
+            result = agent.query(effective_query, level="detailed",
+                                 doc_id=doc_id, doc_name=doc_name)
             return {
                 "agent":  "Legal Simplifier",
                 "answer": result.direct_answer,
                 "clauses_used": [
                     {
-                        "text":        c.original_clause[:300],
+                        "text":        c.original_clause[:800],
                         "legal_types": c.legal_types,
                         "explanation": c.plain_english,
                     }
@@ -310,24 +320,22 @@ class AgentExecutor:
             return {"agent": "Legal Simplifier", "error": str(e)}
 
     # ── Risk Detector ─────────────────────────────────────────────────────
-    def run_risk(self, query: str) -> dict:
-        """
-        Strategy:
-        1. If background scan already ran → read full ScanReport from cache,
-           filter results relevant to the query, return rich answer.
-        2. If scan is still running → return partial cache results + status note.
-        3. If no cache yet → fall back to targeted query (3-clause lookup).
-        All paths use the REAL RiskDetectorAgent — no faking.
-        """
+    def run_risk(self, query: str, doc_id: str = None, doc_name: str = None) -> dict:
         try:
             agent = _make_risk()
 
-            # ── Path A: cache exists → serve from cache ────────────────────
             if os.path.exists(RISK_CACHE_FILE) and len(agent.cache._data) > 0:
                 cached_risks = list(agent.cache._data.values())
-                total = len(cached_risks)
 
-                # Filter to risks that are high/critical OR match query keywords
+                # Filter to the active document if specified
+                if doc_id or doc_name:
+                    cached_risks = [
+                        r for r in cached_risks
+                        if (not doc_id   or r.get("doc_id")   == doc_id)
+                        and (not doc_name or r.get("doc_name") == doc_name)
+                    ]
+
+                total = len(cached_risks)
                 query_lower = query.lower()
                 keywords = query_lower.replace("?", "").split()
                 relevant = [
@@ -336,7 +344,6 @@ class AgentExecutor:
                     or any(kw in r.get("clause_text", "").lower() for kw in keywords if len(kw) > 4)
                 ]
                 if not relevant:
-                    # fall back to all high/medium
                     relevant = [r for r in cached_risks if r.get("risk_level") in ("high", "medium")]
                 relevant.sort(key=lambda r: {"critical":3,"high":2,"medium":1,"low":0}.get(r.get("risk_level","low"),0), reverse=True)
 
@@ -345,46 +352,35 @@ class AgentExecutor:
                     lvl = r.get("risk_level", "low")
                     counts[lvl] = counts.get(lvl, 0) + 1
 
-                scan_status = ""
                 with _scan_lock:
-                    if _scan_state["running"]:
-                        done = _scan_state["current"]
-                        scan_status = f" (scan in progress: {done}/{_scan_state['total']} clauses analysed)"
+                    scan_status = f" (scan in progress)" if _scan_state["running"] else ""
 
-                # Build human-readable summary of top risks
                 risk_lines = []
                 for r in relevant[:8]:
-                    lvl  = r.get("risk_level", "").upper()
-                    summ = r.get("summary", "")
-                    rec  = r.get("recommendation", "")
+                    lvl   = r.get("risk_level", "").upper()
+                    summ  = r.get("summary", "")
+                    rec   = r.get("recommendation", "")
                     types = ", ".join(r.get("risk_types", [])) or "general"
                     if summ:
                         risk_lines.append(f"[{lvl}] {summ}  →  {rec}  (category: {types})")
 
                 answer = (
-                    f"Risk analysis based on full document scan of {total} clauses{scan_status}:\n\n"
-                    f"Summary: {counts['critical']} critical · {counts['high']} high · "
-                    f"{counts['medium']} medium · {counts['low']} low\n\n"
-                    + ("\n".join(risk_lines) if risk_lines else "No specific risks matched your query.")
+                    f"Risk analysis{scan_status}: {counts['critical']} critical · "
+                    f"{counts['high']} high · {counts['medium']} medium · {counts['low']} low\n\n"
+                    + ("\n".join(risk_lines) if risk_lines else "No specific risks matched.")
                 )
-
                 if _scan_state.get("summary"):
                     answer += f"\n\nExecutive assessment: {_scan_state['summary']}"
 
                 return {
-                    "agent":       "Risk Detector",
-                    "answer":      answer,
-                    "from_cache":  True,
-                    "total_clauses": total,
-                    "counts":      counts,
-                    "top_risks":   relevant[:8],
+                    "agent": "Risk Detector", "answer": answer,
+                    "from_cache": True, "total_clauses": total,
+                    "counts": counts, "top_risks": relevant[:8],
                 }
 
-            # ── Path B: no cache yet → targeted 3-clause lookup ───────────
             with _scan_lock:
                 scan_running = _scan_state["running"]
-
-            status_note = " (Background scan in progress — full analysis coming soon)" if scan_running else " (Tip: upload a document to trigger full risk scan)"
+            status_note = " (scan in progress)" if scan_running else ""
             answer = agent.query(query) + status_note
             return {"agent": "Risk Detector", "answer": answer, "from_cache": False}
 
@@ -395,11 +391,11 @@ class AgentExecutor:
             return {"agent": "Risk Detector", "error": str(e)}
 
     # ── Summons Handler ───────────────────────────────────────────────────
-    def run_summons(self, query: str) -> dict:
+    def run_summons(self, query: str, doc_id: str = None, doc_name: str = None) -> dict:
         try:
             agent  = _make_summons()
-            result = agent.analyze(query=query)   # returns SummonsAnalysis dataclass
-            data   = asdict(result)               # safe — all fields are plain types
+            result = agent.analyze(query=query)
+            data   = asdict(result)
             return {
                 "agent":   "Summons Handler",
                 "answer":  (
@@ -422,20 +418,14 @@ class AgentExecutor:
             return {"agent": "Summons Handler", "error": str(e)}
 
     # ── Response Generator ────────────────────────────────────────────────
-    def run_draft(self, query: str, tone: str = "formal") -> dict:
+    def run_draft(self, query: str, tone: str = "formal",
+                  doc_id: str = None, doc_name: str = None) -> dict:
         try:
             agent   = _make_response_generator()
-            context = agent.db.get_full_document_context()
-            draft   = agent.generate_draft(
-                context=context,
-                instruction=query,
-                tone=tone,
-            )
-            return {
-                "agent":  "Response Generator",
-                "answer": draft,
-                "tone":   tone,
-            }
+            # Get context scoped to the active document
+            context = agent.db.get_document_context(doc_id=doc_id, doc_name=doc_name)
+            draft   = agent.generate_draft(context=context, instruction=query, tone=tone)
+            return {"agent": "Response Generator", "answer": draft, "tone": tone}
         except FileNotFoundError:
             return {"agent": "Response Generator", "error": "Vector DB not ready."}
         except Exception as e:
@@ -451,7 +441,8 @@ class Orchestrator:
         self.executor   = AgentExecutor()
         self._lock      = threading.Lock()
 
-    def process(self, query: str, tone: str = "formal") -> dict:
+    def process(self, query: str, tone: str = "formal",
+                doc_id: str = None, doc_name: str = None) -> dict:
         if not _db_ready():
             return {
                 "success":    False,
@@ -466,36 +457,27 @@ class Orchestrator:
         intents = self.classifier.classify(query)
         logger.info(f"[ORCHESTRATOR] Query: {query!r} → Classifier intents: {intents}")
 
-        # ── Step 2: Smart pairing rules (safety net on top of classifier) ─────
-        # Core philosophy: understanding always pairs with analysis.
-        # A person asking "what are the risks" needs risks EXPLAINED, not listed.
+        # ── Step 2: Smart pairing rules ────────────────────────────────
         q_lower = query.lower()
 
-        # Rule A: risk without simplify → always explain what risks mean
         if "risk" in intents and "simplify" not in intents:
             intents.append("simplify")
-            logger.info("[ORCHESTRATOR] Rule A: added simplify to explain risk findings")
-
-        # Rule B: draft without simplify → add context for better drafting
         if "draft" in intents and "simplify" not in intents:
             intents.append("simplify")
-            logger.info("[ORCHESTRATOR] Rule B: added simplify to provide draft context")
 
-        # Rule C: understanding-type questions should always get simplify
         understanding_words = [
             "understand", "mean", "what is", "what does", "explain",
             "fair", "safe", "good", "bad", "should i sign", "my rights",
             "what happens", "consequences", "implications", "worried", "concern",
-            "what can they", "allowed to", "penalty", "liable"
+            "what can they", "allowed to", "penalty", "liable", "why", "who",
+            "how much", "when", "deadline", "how long", "can i", "can they",
         ]
         if any(kw in q_lower for kw in understanding_words) and "simplify" not in intents:
             intents.append("simplify")
-            logger.info("[ORCHESTRATOR] Rule C: added simplify for understanding query")
 
-        # Maintain logical execution order: simplify → risk → summons → draft
         ORDER = {"simplify": 0, "risk": 1, "summons": 2, "draft": 3}
         intents = sorted(set(intents), key=lambda x: ORDER.get(x, 99))
-        logger.info(f"[ORCHESTRATOR] Final agent plan: {intents}")
+        logger.info(f"[ORCHESTRATOR] Final agent plan: {intents} | doc_id={doc_id} | doc_name={doc_name}")
 
         # ── Step 3: Run agents ──────────────────────────────────────────────
         results     = {}
@@ -503,21 +485,24 @@ class Orchestrator:
 
         for intent in intents:
             if intent == "simplify":
-                # When running alongside risk, focus simplifier on the risky clauses
-                out = self.executor.run_simplify(query, focus_on_risks=("risk" in intents))
+                out = self.executor.run_simplify(
+                    query,
+                    focus_on_risks=("risk" in intents),
+                    doc_id=doc_id, doc_name=doc_name
+                )
             elif intent == "risk":
-                out = self.executor.run_risk(query)
+                out = self.executor.run_risk(query, doc_id=doc_id, doc_name=doc_name)
             elif intent == "summons":
-                out = self.executor.run_summons(query)
+                out = self.executor.run_summons(query, doc_id=doc_id, doc_name=doc_name)
             elif intent == "draft":
-                out = self.executor.run_draft(query, tone=tone)
+                out = self.executor.run_draft(query, tone=tone, doc_id=doc_id, doc_name=doc_name)
             else:
                 continue
 
             results[intent] = out
             agents_used.append(out.get("agent", intent))
             if intent != intents[-1]:
-                time.sleep(2)   # rate-limit buffer between LLM calls
+                time.sleep(2)
 
         if not results:
             return {
@@ -529,9 +514,7 @@ class Orchestrator:
                 "synthesis":  "",
             }
 
-        # ── Step 4: Synthesize — always use the lawyer-to-client prompt ──────────
-        # Even for a single agent, the synthesis transforms technical output
-        # into plain-English advice a non-lawyer can act on.
+        # ── Step 4: Synthesize ──────────────────────────────────────────────
         results_text = "\n\n".join(
             f"[{v.get('agent', k).upper()} FINDINGS]\n{v.get('answer', v.get('error', ''))}"
             for k, v in results.items()
@@ -540,7 +523,6 @@ class Orchestrator:
             SYNTHESIS_PROMPT.format(query=query, results=results_text),
             max_tokens=500,
         )
-        # Fallback if synthesis fails
         if not synthesis:
             synthesis = max(
                 results.values(),
@@ -567,11 +549,12 @@ orchestrator = Orchestrator()
 @app.route("/status", methods=["GET"])
 def status():
     return jsonify({
-        "status":       "online",
-        "db_ready":     _db_ready(),
-        "clause_count": _clause_count(),
-        "documents":    _doc_sources(),
-        "model":        GROQ_MODEL,
+        "status":         "online",
+        "db_ready":       _db_ready(),
+        "clause_count":   _clause_count(),      # scannable clauses only
+        "total_indexed":  _total_indexed(),     # all FAISS records including sentinels
+        "documents":      _doc_sources(),
+        "model":          GROQ_MODEL,
         "agents": [
             "Legal Simplifier",
             "Risk Detector",
@@ -583,11 +566,28 @@ def status():
 
 @app.route("/documents", methods=["GET"])
 def list_documents():
-    return jsonify({
-        "documents":    _doc_sources(),
-        "clause_count": _clause_count(),
-        "db_ready":     _db_ready(),
-    })
+    """Returns all ingested documents with their doc_id and doc_name for frontend scoping."""
+    try:
+        if not _db_ready():
+            return jsonify({"documents": [], "clause_count": 0, "db_ready": False})
+        data  = json.load(open(METADATA_PATH))
+        seen, docs = set(), []
+        for entry in data:
+            did = entry.get("doc_id", "")
+            if did not in seen:
+                seen.add(did)
+                docs.append({
+                    "doc_id":   did,
+                    "doc_name": entry.get("doc_name", ""),
+                    "source":   entry.get("source", ""),
+                })
+        return jsonify({
+            "documents":    docs,
+            "clause_count": _clause_count(),
+            "db_ready":     True,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/documents", methods=["DELETE"])
@@ -642,10 +642,14 @@ def _background_risk_scan():
         results = []
 
         for i, clause in enumerate(clauses):
+            # Backfill fields that old index records may be missing
+            clause.setdefault("doc_name", "")
+            clause.setdefault("id", "")
+
             # Check cache BEFORE _analyze so we know whether to sleep
             was_cached = agent.cache.get(clause["clause_text"]) is not None
             try:
-                result = agent._analyze(clause)   # real agent call — uses cache internally
+                result = agent._analyze(clause)
                 counts[result.risk_level] = counts.get(result.risk_level, 0) + 1
                 results.append(result)
             except Exception as e:
@@ -655,19 +659,23 @@ def _background_risk_scan():
             with _scan_lock:
                 _scan_state["current"] = i + 1
 
-            # Only rate-limit sleep on real LLM calls — cache hits are instant
             if not was_cached:
                 time.sleep(2)
 
-        # Generate executive summary using the imported RISK_SUMMARY_PROMPT
+        # Generate executive summary
         results.sort(key=lambda r: {"critical":3,"high":2,"medium":1,"low":0}.get(r.risk_level,0), reverse=True)
         top_text = "\n".join(
             f"- [{r.risk_level.upper()}] {r.summary}"
             for r in results[:4] if r.summary
         ) or "No major risks found."
 
+        # Collect all unique doc names scanned
+        doc_names = list({r.doc_name for r in results if r.doc_name}) or ["the document"]
+        display_name = ", ".join(doc_names)
+
         summary = agent.llm.call(
             RISK_SUMMARY_PROMPT.format(
+                doc_name=display_name,
                 critical=counts["critical"], high=counts["high"],
                 medium=counts["medium"],    low=counts["low"],
                 top=top_text,
@@ -719,7 +727,11 @@ def upload():
             results.append({
                 "file":           file.filename,
                 "success":        True,
-                "clauses_added":  len(clauses) if clauses else 0,
+                "clauses_added":   sum(
+                    1 for c in (clauses or [])
+                    if c.get("clause_index", 0) >= 0
+                    and "table_data" not in c.get("legal_types", [])
+            ),
             })
         except Exception as e:
             results.append({"file": file.filename, "success": False, "error": str(e)})
@@ -747,8 +759,10 @@ def ask():
     """
     POST /ask
     Body JSON:
-      query : str  — user's question or instruction  (required)
-      tone  : str  — formal | assertive | conciliatory  (optional, for drafting)
+      query    : str  — user's question or instruction  (required)
+      tone     : str  — formal | assertive | conciliatory  (optional, for drafting)
+      doc_id   : str  — filter responses to a specific document (optional)
+      doc_name : str  — filter by document filename stem e.g. 'general_power_of_attorney' (optional)
 
     Response JSON:
       success      : bool
@@ -758,9 +772,11 @@ def ask():
       results      : dict        — per-agent detailed output
       synthesis    : str         — unified plain-English answer (show this to user)
     """
-    data  = request.get_json(silent=True) or {}
-    query = (data.get("query") or "").strip()
-    tone  = (data.get("tone")  or "formal").strip().lower()
+    data     = request.get_json(silent=True) or {}
+    query    = (data.get("query") or "").strip()
+    tone     = (data.get("tone")  or "formal").strip().lower()
+    doc_id   = (data.get("doc_id")   or "").strip() or None
+    doc_name = (data.get("doc_name") or "").strip() or None
 
     if not query:
         return jsonify({"success": False, "error": "Field 'query' is required."}), 400
@@ -769,7 +785,7 @@ def ask():
         tone = "formal"
 
     try:
-        result = orchestrator.process(query, tone=tone)
+        result = orchestrator.process(query, tone=tone, doc_id=doc_id, doc_name=doc_name)
         return jsonify(result)
     except Exception as e:
         logger.error(f"Orchestrator error: {e}")

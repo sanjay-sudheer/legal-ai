@@ -935,7 +935,7 @@ function AnalysisPanel({ onClose, onAsk }) {
           <>
             {/* Overall verdict */}
             {risk && (
-              <div style={{ background: risk.bg, border: `1px solid ${risk.color}44`, borderRadius: 12, padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 14 }}>
+              <div style={{ background: risk.bg, border: `1px solid ${risk.color}44`, borderRadius: 12, padding: '14px 16px', display: 'flex', alignItems: 'flex-start', gap: 14 }}>
                 <div style={{ width: 44, height: 44, borderRadius: 10, background: `${risk.color}18`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                   <AlertTriangle size={20} style={{ color: risk.color }} />
                 </div>

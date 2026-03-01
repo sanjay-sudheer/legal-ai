@@ -78,14 +78,35 @@ class VectorDB:
         self.index = faiss.read_index(FAISS_INDEX_PATH)
         self.metadata = json.load(open(METADATA_PATH))
 
-    def get_full_document_context(self):
+    def get_document_context(self, doc_id: str = None, doc_name: str = None) -> str:
         """
-        Since only one document exists,
-        return all clauses concatenated.
+        Return the full text of a specific document.
+        If doc_id or doc_name is given, filter to that document.
+        Falls back to the full_document record if present, else concatenates all clauses.
         """
-        return "\n\n---\n\n".join(
-            clause["clause_text"][:800] for clause in self.metadata
+        candidates = self.metadata
+        if doc_id:
+            candidates = [c for c in candidates if c.get("doc_id") == doc_id]
+        elif doc_name:
+            candidates = [c for c in candidates if c.get("doc_name") == doc_name]
+
+        # Prefer the dedicated full_document record
+        full_doc = next(
+            (c for c in candidates if c.get("clause_index") == -1), None
         )
+        if full_doc:
+            return full_doc["clause_text"][:8000]
+
+        # Fallback: concatenate clause records (excluding table extras)
+        return "\n\n---\n\n".join(
+            c["clause_text"][:1200]
+            for c in candidates
+            if c.get("clause_index", 0) >= 0
+        )
+
+    def get_full_document_context(self) -> str:
+        """Legacy method — returns all documents. Use get_document_context() for multi-doc."""
+        return self.get_document_context()
 
 # ─────────────────────────────────────────────
 # LLM CLIENT
